@@ -66,10 +66,14 @@ VOICE_MAP = {
 
 DEFAULT_VOICE = "English (US) - Jenny (Female)"
 
-# Resolution presets
+# Resolution presets (supporting both standard landscape and vertical TikTok/Reels 9:16)
 RESOLUTIONS = {
-    "1080p (1920x1080)": (1920, 1080),
-    "720p (1280x720)": (1280, 720),
+    "Auto-Detect from HTML": None,
+    "1080x1920 (TikTok / Reels / Shorts 9:16)": (1080, 1920),
+    "720x1280 (Mobile Vertical 9:16)": (720, 1280),
+    "1080p (1920x1080 Landscape 16:9)": (1920, 1080),
+    "720p (1280x720 Landscape 16:9)": (1280, 720),
+    "1080x1080 (Square 1:1)": (1080, 1080),
 }
 
 
@@ -195,12 +199,20 @@ def extract_text(html_content: str) -> str:
 
     soup = BeautifulSoup(html_content, "html.parser")
 
-    # Remove non-content and layout tags
-    for tag in soup(["script", "style", "nav", "footer", "header", "noscript", "svg", "form", "aside", "iframe"]):
+    # Remove non-content and layout tags (including buttons and controls)
+    for tag in soup(["script", "style", "nav", "footer", "header", "noscript", "svg", "form", "aside", "iframe", "button"]):
         tag.decompose()
 
-    # Check if this HTML has multi-slide structures (reveal.js, Marp, sections, or .slide)
-    slide_elements = soup.find_all(lambda t: t.name in ["section"] or any("slide" in str(c).lower() for c in t.get("class", [])))
+    # Priority 1: Check for explicit data-say narration script attributes on scenes
+    say_nodes = soup.find_all(lambda t: t.has_attr("data-say") and t["data-say"].strip())
+    if say_nodes:
+        say_lines = [t["data-say"].strip() for t in say_nodes]
+        return "\n\n".join(say_lines)
+
+    # Priority 2: Check if this HTML has multi-slide structures (reveal.js, Marp, sections, or .slide / .scene)
+    slide_elements = soup.find_all(
+        lambda t: t.name in ["section"] or any(k in str(c).lower() for c in t.get("class", []) for k in ["slide", "scene"])
+    )
     
     # If multiple distinct slides are present, extract text slide by slide
     if len(slide_elements) > 1:
@@ -412,7 +424,21 @@ async def html_to_video(
     if not has_ffmpeg:
         raise RuntimeError("FFmpeg is not installed or not in PATH.")
 
-    width, height = RESOLUTIONS.get(resolution, (1280, 720))
+    # Resolve resolution (Auto-Detect from HTML or explicit preset)
+    if resolution not in RESOLUTIONS or RESOLUTIONS[resolution] is None:
+        is_vertical = False
+        target_path = Path(html_url_or_path)
+        if target_path.is_file():
+            try:
+                with open(target_path, "r", encoding="utf-8", errors="ignore") as f:
+                    snippet = f.read(15000)
+                    if "9/16" in snippet or "9 / 16" in snippet or "tiktok" in snippet.lower() or "shorts" in snippet.lower():
+                        is_vertical = True
+            except Exception:
+                pass
+        width, height = (1080, 1920) if is_vertical else (1920, 1080)
+    else:
+        width, height = RESOLUTIONS[resolution]
 
     # Format file:// URL if given local filesystem path
     if not html_url_or_path.startswith(("http://", "https://", "file://")):
@@ -458,111 +484,150 @@ async def html_to_video(
                 await browser.close()
                 raise RuntimeError(f"Failed to load HTML in Chromium: {str(e)}")
 
-            # 1. Detect if this is an interactive or multi-slide deck
-            slide_data = await page.evaluate("""() => {
-                if (window.Reveal && typeof window.Reveal.getSlides === 'function') {
-                    const rSlides = window.Reveal.getSlides();
-                    if (rSlides && rSlides.length > 1) return { type: 'reveal', count: rSlides.length };
+            # 1. Detect if page defines its own internal timeline / timed scenes (e.g. data-d scenes or window.total)
+            html_timeline = await page.evaluate("""() => {
+                if (typeof window.total === 'number' && window.total > 1000) {
+                    return window.total / 1000;
                 }
-                const marp = document.querySelectorAll('svg[data-marpit-svg], .marpit > section');
-                if (marp.length > 1) return { type: 'marp', count: marp.length };
-                const classSlides = document.querySelectorAll('.slide, [data-slide], .swiper-slide, section.slide');
-                if (classSlides.length > 1) return { type: 'class', count: classSlides.length };
-                const sec = document.querySelectorAll('body > section, main > section, .slides > section, .container > section, div.section');
-                if (sec.length > 1) return { type: 'sections', count: sec.length };
-                return { type: 'scroll', count: 1 };
+                const dNodes = document.querySelectorAll('[data-d]');
+                if (dNodes.length > 0) {
+                    let sum = 0;
+                    dNodes.forEach(n => sum += Number(n.dataset.d || 0));
+                    if (sum > 1000) return sum / 1000;
+                }
+                return 0;
             }""")
 
-            is_slide_deck = (
-                animation_mode == "Slide Deck (Step through each slide)" or
-                (animation_mode.startswith("Auto") and slide_data.get("count", 1) > 1)
-            )
+            # Ensure video duration captures the entire timeline
+            if html_timeline > 0 and duration < (html_timeline + 0.5):
+                duration = html_timeline + 0.8
 
-            if is_slide_deck:
-                num_slides = max(2, slide_data.get("count", 2))
-                time_per_slide = duration / num_slides
+            # Check if this is an automated self-playing timeline (e.g. TikTok promo HTML with .scene and play/restart)
+            is_self_playing = await page.evaluate("""() => {
+                const s = document.querySelectorAll('.scene[data-d], .scene');
+                return (s.length > 1 && (typeof window.play === 'function' || typeof window.restart === 'function'));
+            }""")
+
+            if is_self_playing:
                 if progress:
-                    progress(0.5, desc=f"Detected slide presentation ({num_slides} slides). Stepping through each slide...")
-
-                for slide_idx in range(num_slides):
-                    if progress:
-                        progress(
-                            0.5 + (slide_idx / num_slides) * 0.35,
-                            desc=f"Recording slide {slide_idx + 1} of {num_slides}..."
-                        )
-
-                    # Display current slide for its allocated duration
-                    await page.wait_for_timeout(time_per_slide * 1000)
-
-                    # Advance to next slide if not the final one
-                    if slide_idx < num_slides - 1:
-                        await page.evaluate(f"""() => {{
-                            if (window.Reveal && typeof window.Reveal.next === 'function') {{
-                                window.Reveal.next();
-                                return;
-                            }}
-                            const sel = '.slide, [data-slide], svg[data-marpit-svg], body > section, main > section, .slides > section, .container > section, div.section, section';
-                            const allSlides = document.querySelectorAll(sel);
-                            if (allSlides && allSlides[{slide_idx + 1}]) {{
-                                allSlides[{slide_idx + 1}].scrollIntoView({{ behavior: 'smooth', block: 'start' }});
-                            }}
-                        }}""")
-                        await page.keyboard.press("ArrowRight")
-                        await page.wait_for_timeout(350)
-
-            elif animation_mode == "Static (Hold first view)":
-                if progress:
-                    progress(0.6, desc=f"Recording static view for {duration:.1f}s...")
+                    progress(0.5, desc=f"Recording self-playing timeline ({duration:.1f}s)...")
+                # Reset animation timeline to time 0 so Scene 1 records cleanly from start
+                await page.evaluate("""() => {
+                    if (typeof window.restart === 'function') {
+                        window.restart();
+                    } else {
+                        const btn = document.getElementById('replay') || document.querySelector('#replay, .replay');
+                        if (btn) btn.click();
+                    }
+                }""")
                 await page.wait_for_timeout(duration * 1000)
 
+            # 2. Detect if this is an interactive slide deck (Reveal.js, Marp, or generic slides)
             else:
-                # Continuous smooth scroll for articles and tall documents
-                if progress:
-                    progress(0.6, desc=f"Recording {duration:.1f}s video with smooth scroll...")
+                slide_data = await page.evaluate("""() => {
+                    if (window.Reveal && typeof window.Reveal.getSlides === 'function') {
+                        const rSlides = window.Reveal.getSlides();
+                        if (rSlides && rSlides.length > 1) return { type: 'reveal', count: rSlides.length };
+                    }
+                    const marp = document.querySelectorAll('svg[data-marpit-svg], .marpit > section');
+                    if (marp.length > 1) return { type: 'marp', count: marp.length };
+                    const classSlides = document.querySelectorAll('.slide, [data-slide], .swiper-slide, section.slide');
+                    if (classSlides.length > 1) return { type: 'class', count: classSlides.length };
+                    const sec = document.querySelectorAll('body > section, main > section, .slides > section, .container > section, div.section');
+                    if (sec.length > 1) return { type: 'sections', count: sec.length };
+                    return { type: 'scroll', count: 1 };
+                }""")
 
-                scroll_script = f"""
-                (() => {{
-                    const durationMs = {duration * 1000};
-                    const startTime = performance.now();
-                    const scrollEl = document.scrollingElement || document.documentElement || document.body;
-                    const docScroll = Math.max(0, scrollEl.scrollHeight - window.innerHeight);
+                is_slide_deck = (
+                    animation_mode == "Slide Deck (Step through each slide)" or
+                    (animation_mode.startswith("Auto") and slide_data.get("count", 1) > 1)
+                )
 
-                    const containers = Array.from(document.querySelectorAll('div, main, section, article')).filter(el => {{
-                        const st = window.getComputedStyle(el);
-                        return (st.overflowY === 'auto' || st.overflowY === 'scroll') && (el.scrollHeight - el.clientHeight > 20);
-                    }});
+                if is_slide_deck:
+                    num_slides = max(2, slide_data.get("count", 2))
+                    time_per_slide = duration / num_slides
+                    if progress:
+                        progress(0.5, desc=f"Detected slide presentation ({num_slides} slides). Stepping through each slide...")
 
-                    const pauseStartMs = 1200;
-                    const pauseEndMs = 1500;
-                    const scrollDurationMs = Math.max(1000, durationMs - pauseStartMs - pauseEndMs);
+                    for slide_idx in range(num_slides):
+                        if progress:
+                            progress(
+                                0.5 + (slide_idx / num_slides) * 0.35,
+                                desc=f"Recording slide {slide_idx + 1} of {num_slides}..."
+                            )
 
-                    function step(now) {{
-                        const elapsed = now - startTime;
-                        let progress = 0;
-                        if (elapsed <= pauseStartMs) {{
-                            progress = 0;
-                        }} else if (elapsed >= durationMs - pauseEndMs) {{
-                            progress = 1;
-                        }} else {{
-                            progress = Math.min((elapsed - pauseStartMs) / scrollDurationMs, 1);
+                        # Display current slide for its allocated duration
+                        await page.wait_for_timeout(time_per_slide * 1000)
+
+                        # Advance to next slide if not the final one
+                        if slide_idx < num_slides - 1:
+                            await page.evaluate(f"""() => {{
+                                if (window.Reveal && typeof window.Reveal.next === 'function') {{
+                                    window.Reveal.next();
+                                    return;
+                                }}
+                                const sel = '.slide, [data-slide], svg[data-marpit-svg], body > section, main > section, .slides > section, .container > section, div.section, section';
+                                const allSlides = document.querySelectorAll(sel);
+                                if (allSlides && allSlides[{slide_idx + 1}]) {{
+                                    allSlides[{slide_idx + 1}].scrollIntoView({{ behavior: 'smooth', block: 'start' }});
+                                }}
+                            }}""")
+                            await page.keyboard.press("ArrowRight")
+                            await page.wait_for_timeout(350)
+
+                elif animation_mode == "Static (Hold first view)":
+                    if progress:
+                        progress(0.6, desc=f"Recording static view for {duration:.1f}s...")
+                    await page.wait_for_timeout(duration * 1000)
+
+                else:
+                    # Continuous smooth scroll for articles and tall documents
+                    if progress:
+                        progress(0.6, desc=f"Recording {duration:.1f}s video with smooth scroll...")
+
+                    scroll_script = f"""
+                    (() => {{
+                        const durationMs = {duration * 1000};
+                        const startTime = performance.now();
+                        const scrollEl = document.scrollingElement || document.documentElement || document.body;
+                        const docScroll = Math.max(0, scrollEl.scrollHeight - window.innerHeight);
+
+                        const containers = Array.from(document.querySelectorAll('div, main, section, article')).filter(el => {{
+                            const st = window.getComputedStyle(el);
+                            return (st.overflowY === 'auto' || st.overflowY === 'scroll') && (el.scrollHeight - el.clientHeight > 20);
+                        }});
+
+                        const pauseStartMs = 1200;
+                        const pauseEndMs = 1500;
+                        const scrollDurationMs = Math.max(1000, durationMs - pauseStartMs - pauseEndMs);
+
+                        function step(now) {{
+                            const elapsed = now - startTime;
+                            let progress = 0;
+                            if (elapsed <= pauseStartMs) {{
+                                progress = 0;
+                            }} else if (elapsed >= durationMs - pauseEndMs) {{
+                                progress = 1;
+                            }} else {{
+                                progress = Math.min((elapsed - pauseStartMs) / scrollDurationMs, 1);
+                            }}
+
+                            if (docScroll > 0) {{
+                                window.scrollTo(0, docScroll * progress);
+                            }}
+                            for (const c of containers) {{
+                                c.scrollTop = (c.scrollHeight - c.clientHeight) * progress;
+                            }}
+
+                            if (elapsed < durationMs) {{
+                                requestAnimationFrame(step);
+                            }}
                         }}
-
-                        if (docScroll > 0) {{
-                            window.scrollTo(0, docScroll * progress);
-                        }}
-                        for (const c of containers) {{
-                            c.scrollTop = (c.scrollHeight - c.clientHeight) * progress;
-                        }}
-
-                        if (elapsed < durationMs) {{
-                            requestAnimationFrame(step);
-                        }}
-                    }}
-                    requestAnimationFrame(step);
-                }})();
-                """
-                await page.evaluate(scroll_script)
-                await page.wait_for_timeout(duration * 1000)
+                        requestAnimationFrame(step);
+                    }})();
+                    """
+                    await page.evaluate(scroll_script)
+                    await page.wait_for_timeout(duration * 1000)
 
             video = page.video
             await page.close()
@@ -800,6 +865,18 @@ async def run_pipeline(
                     # Add 0.5s padding so speech ending feels natural
                     final_duration = max(3.0, round(audio_len + 0.5, 1))
 
+            # If the HTML specifies its own timeline (e.g. data-d scenes in TikTok promo), ensure video duration fits
+            try:
+                soup_pre = BeautifulSoup(html_content, "html.parser")
+                d_nodes = soup_pre.find_all(lambda t: t.has_attr("data-d"))
+                if d_nodes:
+                    sum_ms = sum(float(t["data-d"]) for t in d_nodes if t["data-d"].replace(".", "", 1).isdigit())
+                    if sum_ms > 1000:
+                        html_dur = round((sum_ms / 1000.0) + 0.8, 1)
+                        final_duration = max(final_duration, html_dur)
+            except Exception:
+                pass
+
             output_mp4_path = str(OUTPUTS_DIR / f"video_{timestamp}.mp4")
 
             await html_to_video(
@@ -950,6 +1027,16 @@ def create_ui():
                         value="1080p (1920x1080)",
                         label="Resolution",
                     )
+                    animation_mode_dropdown = gr.Dropdown(
+                        choices=[
+                            "Auto-detect (Presentations & Scrolling)",
+                            "Slide Deck (Step through each slide)",
+                            "Continuous Smooth Scroll (Articles/Long pages)",
+                            "Static (Hold first view)",
+                        ],
+                        value="Auto-detect (Presentations & Scrolling)",
+                        label="Animation & Slide Display Mode",
+                    )
                     add_narration_checkbox = gr.Checkbox(
                         label="Add narration voiceover (synchronizes audio to video)",
                         value=True,
@@ -1049,6 +1136,7 @@ def create_ui():
                 voice_dropdown,
                 speed_slider,
                 resolution_dropdown,
+                animation_mode_dropdown,
                 add_narration_checkbox,
                 sync_duration_checkbox,
                 duration_slider,

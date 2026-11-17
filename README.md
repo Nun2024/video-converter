@@ -124,15 +124,18 @@ pip install imageio-ffmpeg
 5. Once complete, listen to the preview directly in the browser or click **Download Result File**.
 
 ### Mode 2: Convert HTML to MP4 (Rendered Video + Narration)
-1. **Input**: Upload an `.html` file or paste raw HTML.
+1. **Input**: Upload an `.html` file (e.g. `sample_slides.html` or `sample.html`) or paste raw HTML.
 2. **Format**: Select **"MP4 (Rendered Webpage Video)"**.
 3. **Video Options**:
-   - Choose resolution (**1080p** or **720p**).
-   - Check **"Add narration voiceover"** if you want Edge-TTS speech synthesized and muxed into the video.
-   - Leave **"Auto-sync duration to speech audio length"** checked to automatically match the video duration to the exact length of the speech.
-   - Or uncheck auto-sync and specify custom duration in seconds.
+   - **Resolution**: Choose **1080p** or **720p**.
+   - **Animation & Slide Display Mode**:
+     - `Auto-detect (Presentations & Scrolling)`: Automatically detects if your HTML is a multi-slide presentation (Reveal.js, Marp, HTML5 `<section>` slides, or `.slide` containers) or a tall scrolling webpage.
+     - `Slide Deck (Step through each slide)`: Explicitly steps through each slide from Slide 1 to Slide N using keyboard transitions and smooth slide centering.
+     - `Continuous Smooth Scroll`: Starts with a 1.2s pause at top view, scrolls smoothly to the bottom, and pauses 1.5s on the final view.
+     - `Static (Hold first view)`: Keeps the opening view stationary.
+   - **Narration**: Check **"Add narration voiceover"** to synthesize speech and mux it with the video.
+   - **Auto-Sync**: Matches video duration to speech duration automatically.
 4. Click **🚀 Convert Now**.
-5. The app launches headless Chromium, renders the HTML with smooth automatic scrolling, encodes the video in H.264 + AAC, and outputs a playable MP4 with a download button.
 
 ### 🖼️ Working with Local Assets (Images & Custom CSS)
 When you upload an HTML file using the **Upload HTML File** tab, the application loads it via its local filesystem path (`file:///...`). This ensures that relative references such as `<img src="photo.jpg">` or `<link rel="stylesheet" href="style.css">` in the same directory load properly.
