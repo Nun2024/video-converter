@@ -133,8 +133,12 @@ pip install imageio-ffmpeg
      - `Slide Deck (Step through each slide)`: Explicitly steps through each slide from Slide 1 to Slide N using keyboard transitions and smooth slide centering.
      - `Continuous Smooth Scroll`: Starts with a 1.2s pause at top view, scrolls smoothly to the bottom, and pauses 1.5s on the final view.
      - `Static (Hold first view)`: Keeps the opening view stationary.
-   - **Narration**: Check **"Add narration voiceover"** to synthesize speech and mux it with the video.
-   - **Auto-Sync**: Matches video duration to speech duration automatically.
+   - **Video Duration & Length**:
+     - Video length is strictly prioritized — audio will **never truncate or cut short the video**.
+     - If your HTML has built-in scene timers or animations, the app automatically captures all scenes to the very end.
+     - You can manually set any duration (e.g. 30s, 60s) with the duration slider.
+   - **Narration**: Check **"Add narration voiceover"** if you want speech audio muxed into the video.
+   - **Extend duration**: Check if you want the video extended should narration happen to exceed the video duration.
 4. Click **🚀 Convert Now**.
 
 ### 🖼️ Working with Local Assets (Images & Custom CSS)

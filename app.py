@@ -66,6 +66,15 @@ VOICE_MAP = {
 
 DEFAULT_VOICE = "English (US) - Jenny (Female)"
 
+RESOLUTION_CHOICES = [
+    "Auto-Detect from HTML",
+    "1080x1920 (TikTok / Reels / Shorts 9:16)",
+    "720x1280 (Mobile Vertical 9:16)",
+    "1080p (1920x1080 Landscape 16:9)",
+    "720p (1280x720 Landscape 16:9)",
+    "1080x1080 (Square 1:1)",
+]
+
 # Resolution presets (supporting both standard landscape and vertical TikTok/Reels 9:16)
 RESOLUTIONS = {
     "Auto-Detect from HTML": None,
@@ -74,6 +83,8 @@ RESOLUTIONS = {
     "1080p (1920x1080 Landscape 16:9)": (1920, 1080),
     "720p (1280x720 Landscape 16:9)": (1280, 720),
     "1080x1080 (Square 1:1)": (1080, 1080),
+    "1080p (1920x1080)": (1920, 1080),
+    "720p (1280x720)": (1280, 720),
 }
 
 
@@ -644,17 +655,21 @@ async def html_to_video(
             progress(0.85, desc="Transcoding video to MP4 (H.264 + AAC)...")
 
         # Encode WebM to standard MP4 with FFmpeg (muxing audio if provided)
+        # Full video length is strictly preserved: NEVER use -shortest, the video stream dictates output duration
+        video_real_dur = get_media_duration(recorded_webm_file)
         if audio_path and os.path.exists(audio_path):
             cmd = [
                 ffmpeg_bin,
                 "-y",
                 "-i", recorded_webm_file,
                 "-i", audio_path,
+                "-map", "0:v:0",
+                "-map", "1:a:0?",
                 "-c:v", "libx264",
                 "-pix_fmt", "yuv420p",
                 "-c:a", "aac",
                 "-b:a", "192k",
-                "-shortest",
+                "-t", f"{video_real_dur:.2f}",
                 "-movflags", "+faststart",
                 output_mp4_path
             ]
@@ -690,20 +705,23 @@ async def html_to_video(
 # ---------------------------------------------------------------------------
 
 def merge_audio_video(video_path: str, audio_path: str, output_path: str) -> str:
-    """Mux an existing MP4/WebM video and an MP3/AAC audio into a combined MP4."""
+    """Mux an existing MP4/WebM video and an MP3/AAC audio into a combined MP4, strictly keeping full video length."""
     has_ffmpeg, ffmpeg_bin = check_ffmpeg()
     if not has_ffmpeg:
         raise RuntimeError("FFmpeg is not installed or not in PATH.")
 
+    video_dur = get_media_duration(video_path)
     cmd = [
         ffmpeg_bin,
         "-y",
         "-i", video_path,
         "-i", audio_path,
+        "-map", "0:v:0",
+        "-map", "1:a:0?",
         "-c:v", "copy",
         "-c:a", "aac",
         "-b:a", "192k",
-        "-shortest",
+        "-t", f"{video_dur:.2f}",
         "-movflags", "+faststart",
         output_path
     ]
@@ -839,6 +857,18 @@ async def run_pipeline(
             output_audio_path = None
             final_duration = float(video_duration)
 
+            # 1. Prioritize full video length: detect HTML internal animation timeline
+            try:
+                soup_pre = BeautifulSoup(html_content, "html.parser")
+                d_nodes = soup_pre.find_all(lambda t: t.has_attr("data-d"))
+                if d_nodes:
+                    sum_ms = sum(float(t["data-d"]) for t in d_nodes if t["data-d"].replace(".", "", 1).isdigit())
+                    if sum_ms > 1000:
+                        html_dur = round((sum_ms / 1000.0) + 1.2, 1)
+                        final_duration = max(final_duration, html_dur)
+            except Exception:
+                pass
+
             if add_narration:
                 if not extracted_text.strip():
                     return (
@@ -862,20 +892,8 @@ async def run_pipeline(
 
                 if sync_duration:
                     audio_len = get_media_duration(temp_audio)
-                    # Add 0.5s padding so speech ending feels natural
-                    final_duration = max(3.0, round(audio_len + 0.5, 1))
-
-            # If the HTML specifies its own timeline (e.g. data-d scenes in TikTok promo), ensure video duration fits
-            try:
-                soup_pre = BeautifulSoup(html_content, "html.parser")
-                d_nodes = soup_pre.find_all(lambda t: t.has_attr("data-d"))
-                if d_nodes:
-                    sum_ms = sum(float(t["data-d"]) for t in d_nodes if t["data-d"].replace(".", "", 1).isdigit())
-                    if sum_ms > 1000:
-                        html_dur = round((sum_ms / 1000.0) + 0.8, 1)
-                        final_duration = max(final_duration, html_dur)
-            except Exception:
-                pass
+                    # Only extend if audio is longer than final_duration; NEVER shrink below video length!
+                    final_duration = max(final_duration, round(audio_len + 0.8, 1))
 
             output_mp4_path = str(OUTPUTS_DIR / f"video_{timestamp}.mp4")
 
@@ -1023,8 +1041,8 @@ def create_ui():
                 with gr.Group(visible=False) as video_settings_group:
                     gr.Markdown("#### 🎥 Video Rendering Options (Playwright)")
                     resolution_dropdown = gr.Dropdown(
-                        choices=list(RESOLUTIONS.keys()),
-                        value="1080p (1920x1080)",
+                        choices=RESOLUTION_CHOICES,
+                        value="Auto-Detect from HTML",
                         label="Resolution",
                     )
                     animation_mode_dropdown = gr.Dropdown(
@@ -1042,16 +1060,16 @@ def create_ui():
                         value=True,
                     )
                     sync_duration_checkbox = gr.Checkbox(
-                        label="Auto-sync duration to speech audio length",
-                        value=True,
+                        label="Extend duration if narration is longer than video",
+                        value=False,
                     )
                     duration_slider = gr.Slider(
                         minimum=3,
-                        maximum=120,
-                        value=10,
+                        maximum=300,
+                        value=30,
                         step=1,
-                        label="Manual Video Duration (seconds)",
-                        interactive=False,
+                        label="Target Video Duration (seconds) - Video length is strictly prioritized",
+                        interactive=True,
                     )
 
                 convert_btn = gr.Button("🚀 Convert Now", variant="primary", elem_classes=["convert-btn"], size="lg")
@@ -1103,11 +1121,11 @@ def create_ui():
             return {
                 audio_settings_group: gr.update(visible=(is_mp3 or add_narr)),
                 sync_duration_checkbox: gr.update(visible=add_narr),
-                duration_slider: gr.update(interactive=(not sync_dur or not add_narr)),
+                duration_slider: gr.update(interactive=True),
             }
 
         def on_sync_duration_toggle(sync_dur: bool, add_narr: bool):
-            return gr.update(interactive=(not sync_dur or not add_narr))
+            return gr.update(interactive=True)
 
         output_format_radio.change(
             fn=on_format_change,
